@@ -67,32 +67,40 @@ def decode_domain_name(data, offset):
 
 def extract_ip_from_response(response_data):
     """
-    Parses an upstream DNS response packet to find and extract 
-    the resolved IPv4 address for caching.
+    Parses an upstream DNS response packet, scanning through multiple answer
+    records to find and extract the first valid Type-A IPv4 address and its TTL.
     """
     try:
-        # 1. Skip the 12-byte header and decode the domain in the question section
+        # 1. Move past header and decode domain in the Question section
         _, offset = decode_domain_name(response_data, 12)
+        offset += 4  # Skip QTYPE (2B) and QCLASS (2B)
         
-        # 2. Skip past QTYPE (2 bytes) and QCLASS (2 bytes)
-        offset += 4 
+        # 2. Extract total Answer count from Header (bytes 6-7)
+        ancount = struct.unpack('!H', response_data[6:8])[0]
         
-        # 3. Now we are at the Answer Section. 
-        # Skip the name pointer/domain name component (usually 2 bytes like \xc0\x0c)
-        offset += 2 
-        
-        # 4. Read Type, Class, TTL, and Data Length
-        ans_type, ans_class, ans_ttl, ans_rdlength = struct.unpack('!HHIH', response_data[offset:offset+10])
-        offset += 10
-        
-        # 5. If Type is 1 (A Record) and length is 4 bytes (IPv4), extract the raw IP bytes
-        if ans_type == 1 and ans_rdlength == 4:
-            raw_ip_bytes = response_data[offset:offset+4]
-            # Convert raw bytes (e.g., \xc0\xa8\x01\x64) back to a string ("192.168.1.100")
-            return socket.inet_ntoa(raw_ip_bytes)
+        # 3. Loop through the Answer records to find an A-record (Type 1)
+        for _ in range(ancount):
+            # Check for compression pointer (0xc000) or raw label
+            if (response_data[offset] & 0xc0) == 0xc0:
+                offset += 2 # Skip compression pointer
+            else:
+                _, offset = decode_domain_name(response_data, offset)
+                
+            # Read Type, Class, TTL, and Data Length for this specific answer record
+            ans_type, ans_class, ans_ttl, ans_rdlength = struct.unpack('!HHIH', response_data[offset:offset+10])
+            offset += 10
             
-    except Exception:
-        return None # Return None if packet parsing fails (e.g., truncated packet)
+            # If we found our A-record, extract the IP and return it!
+            if ans_type == 1 and ans_rdlength == 4:
+                raw_ip_bytes = response_data[offset:offset+4]
+                return socket.inet_ntoa(raw_ip_bytes), ans_ttl
+                
+            # Otherwise, skip past this record's data block (like CNAME strings) and check the next one
+            offset += ans_rdlength
+            
+    except Exception as e:
+        # print(f"Parser debug exception: {e}") # Left here for debugging if needed
+        return None
     return None
 
 def build_local_response(query_data, domain, ip_address, qtype, qclass):
@@ -163,12 +171,12 @@ def handle_client_query(data, client_address, server_socket):
         
         print(f"[Query] Request for '{domain}' (Type: {qtype}) from {client_address}")
         
-        # ROUTING CRITERIA 1: NEW! Threat Intelligence Firewall (Blocklist Interception)
+        # ROUTING CRITERIA 1: Threat Intelligence Firewall
         if domain.lower() in BLOCKLIST_DOMAINS:
             print(f"  [SECURITY ALERT] Blocked request for malicious domain: '{domain}' from {client_address}")
             response = build_nxdomain_response(data)
             server_socket.sendto(response, client_address)
-            return  # Stop processing immediately!
+            return
             
         # ROUTING CRITERIA 2: Permanent Local Records Match
         elif domain in LOCAL_RECORDS and qtype == 1:
@@ -176,15 +184,26 @@ def handle_client_query(data, client_address, server_socket):
             response = build_local_response(data, domain, LOCAL_RECORDS[domain], qtype, qclass)
             server_socket.sendto(response, client_address)
         
-        # ROUTING CRITERIA 3: Dynamic In-Memory Cache Match
+        # ROUTING CRITERIA 3: Dynamic In-Memory Cache Match (With TTL Expiration Check)
         elif domain in DYNAMIC_CACHE and qtype == 1:
-            cached_ip = DYNAMIC_CACHE[domain]
-            print(f"  -> [Dynamic Cache Hit] Resolving '{domain}' via MEMORY CACHE to {cached_ip}")
-            response = build_local_response(data, domain, cached_ip, qtype, qclass)
-            server_socket.sendto(response, client_address)
+            cached_ip, expiration_time = DYNAMIC_CACHE[domain]
+            current_time = time.time()
             
-        # ROUTING CRITERIA 4: Cache Miss (Forward & Learn)
-        else:
+            # Check if the cache record has expired
+            if current_time > expiration_time:
+                print(f"  -> [Cache Stale] Record for '{domain}' expired. Purging memory cache.")
+                del DYNAMIC_CACHE[domain]  # Clear out old data
+                # Let it naturally fall through to the Cache Miss proxy logic below!
+            else:
+                ttl_remaining = int(expiration_time - current_time)
+                print(f"  -> [Dynamic Cache Hit] Resolving '{domain}' (Valid for another {ttl_remaining}s) to {cached_ip}")
+                response = build_local_response(data, domain, cached_ip, qtype, qclass)
+                server_socket.sendto(response, client_address)
+                return
+                
+        # ROUTING CRITERIA 4: Cache Miss (Forward, Learn, and Store TTL)
+        # Note: Handled as a standard multi-conditional fall-through block
+        if True:  
             print(f"  -> [Cache Miss] Forwarding '{domain}' to upstream {UPSTREAM_DNS[0]}")
             proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             proxy_socket.settimeout(3.0)
@@ -195,10 +214,16 @@ def handle_client_query(data, client_address, server_socket):
                 server_socket.sendto(upstream_response, client_address)
                 
                 if qtype == 1:
-                    extracted_ip = extract_ip_from_response(upstream_response)
-                    if extracted_ip:
-                        DYNAMIC_CACHE[domain] = extracted_ip
-                        print(f"  -> [Cache Update] Memorized '{domain}' = {extracted_ip}")
+                    # Capture both the IP and the live TTL integer from the upstream response
+                    parsed_result = extract_ip_from_response(upstream_response)
+                    if parsed_result:
+                        extracted_ip, upstream_ttl = parsed_result
+                        
+                        # Calculate absolute expiration time: current clock time + TTL seconds
+                        expire_timestamp = time.time() + upstream_ttl
+                        DYNAMIC_CACHE[domain] = (extracted_ip, expire_timestamp)
+                        
+                        print(f"  -> [Cache Update] Memorized '{domain}' = {extracted_ip} (TTL: {upstream_ttl}s)")
                         
             except socket.timeout:
                 print(f"  !! [Timeout] Upstream {UPSTREAM_DNS} failed to respond.")
