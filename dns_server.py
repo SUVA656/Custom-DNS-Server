@@ -4,27 +4,36 @@ import socket
 import struct
 import uuid
 import logging
+import threading
+
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
-LISTEN_IP = "127.0.0.1"
-LISTEN_PORT = 5354
+LISTEN_IP = "0.0.0.0"
+LISTEN_PORT = 53
 
-UPSTREAM_DNS = ("8.8.8.8", 53)
+UPSTREAM_DNS = ("1.1.1.1", 53)
 
 LOCAL_RECORDS = {}
 
 BLOCKLIST_FILE = "blocklist.txt"
 BLOCKLIST_DOMAINS = set()
 
-# Structure:
+# =========================================================
+# CACHE
+# =========================================================
+
 # {
-#   "domain": ("ip", expiration_timestamp)
+#     (domain, qtype): (ip, expiration_timestamp)
 # }
+
 DYNAMIC_CACHE = {}
+
+CACHE_LOCK = threading.Lock()
 
 SECURITY_METRICS = {
     "blocked_domains": 0,
@@ -35,7 +44,7 @@ SECURITY_METRICS = {
 }
 
 # =========================================================
-# LOGGING / AUDIT SYSTEM
+# LOGGING
 # =========================================================
 
 logger = logging.getLogger("DNSAudit")
@@ -43,15 +52,19 @@ logger.setLevel(logging.INFO)
 
 handler = RotatingFileHandler(
     "dns_security_audit.log",
-    maxBytes=10 * 1024 * 1024,  # 10MB
+    maxBytes=10 * 1024 * 1024,
     backupCount=5
 )
 
 formatter = logging.Formatter('%(message)s')
+
 handler.setFormatter(formatter)
 
 logger.addHandler(handler)
 
+# =========================================================
+# AUDIT LOGGING
+# =========================================================
 
 def log_event(event_type,
               severity,
@@ -63,7 +76,10 @@ def log_event(event_type,
 
     log_entry = {
         "event_id": str(uuid.uuid4()),
-        "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        "timestamp": time.strftime(
+            '%Y-%m-%dT%H:%M:%SZ',
+            time.gmtime()
+        ),
         "event_type": event_type,
         "severity": severity,
         "domain": domain,
@@ -75,12 +91,12 @@ def log_event(event_type,
 
     logger.info(json.dumps(log_entry))
 
-
 # =========================================================
-# CONFIG LOADER
+# LOAD CONFIGURATION
 # =========================================================
 
 def load_configuration():
+
     global LISTEN_PORT
     global UPSTREAM_DNS
     global LOCAL_RECORDS
@@ -88,17 +104,30 @@ def load_configuration():
     global BLOCKLIST_DOMAINS
 
     try:
+
         with open("config.json", "r") as f:
             config_data = json.load(f)
 
-        LISTEN_PORT = config_data.get("listen_port", 5354)
-
-        UPSTREAM_DNS = (
-            config_data.get("upstream_dns_ip", "8.8.8.8"),
-            config_data.get("upstream_dns_port", 53)
+        LISTEN_PORT = config_data.get(
+            "listen_port",
+            53
         )
 
-        LOCAL_RECORDS = config_data.get("local_records", {})
+        UPSTREAM_DNS = (
+            config_data.get(
+                "upstream_dns_ip",
+                "1.1.1.1"
+            ),
+            config_data.get(
+                "upstream_dns_port",
+                53
+            )
+        )
+
+        LOCAL_RECORDS = config_data.get(
+            "local_records",
+            {}
+        )
 
         BLOCKLIST_FILE = config_data.get(
             "blocklist_file",
@@ -108,15 +137,23 @@ def load_configuration():
         BLOCKLIST_DOMAINS.clear()
 
         try:
+
             with open(BLOCKLIST_FILE, "r") as bf:
+
                 for line in bf:
+
                     stripped = line.strip().lower()
 
-                    if stripped and not stripped.startswith("#"):
+                    if (
+                        stripped
+                        and not stripped.startswith("#")
+                    ):
                         BLOCKLIST_DOMAINS.add(stripped)
 
             print(
-                f"[*] Loaded {len(BLOCKLIST_DOMAINS)} blocked domains."
+                f"[*] Loaded "
+                f"{len(BLOCKLIST_DOMAINS)} "
+                f"blocked domains."
             )
 
             log_event(
@@ -124,24 +161,27 @@ def load_configuration():
                 severity="INFO",
                 action="LOAD_CONFIG",
                 outcome="SUCCESS",
-                details=f"Loaded {len(BLOCKLIST_DOMAINS)} blocklist domains"
+                details=f"Loaded {len(BLOCKLIST_DOMAINS)} blocked domains"
             )
 
         except FileNotFoundError:
 
-            print(f"[!] Blocklist file '{BLOCKLIST_FILE}' not found.")
+            print(
+                f"[!] Blocklist file "
+                f"'{BLOCKLIST_FILE}' not found."
+            )
 
             log_event(
                 event_type="BLOCKLIST_MISSING",
                 severity="WARNING",
                 action="LOAD_BLOCKLIST",
                 outcome="FAILED",
-                details=f"Missing file: {BLOCKLIST_FILE}"
+                details=BLOCKLIST_FILE
             )
 
     except Exception as e:
 
-        print(f"[!] Failed to load config.json: {e}")
+        print(f"[CONFIG ERROR] {e}")
 
         log_event(
             event_type="CONFIG_LOAD_FAILED",
@@ -151,71 +191,156 @@ def load_configuration():
             details=str(e)
         )
 
-
 # =========================================================
-# DNS PARSER
+# DOMAIN DECODER WITH POINTER SUPPORT
 # =========================================================
 
 def decode_domain_name(data, offset):
 
     labels = []
+    jumped = False
+    original_offset = offset
 
     while True:
 
         length = data[offset]
 
+        # Pointer
+        if (length & 0xC0) == 0xC0:
+
+            pointer = (
+                ((length & 0x3F) << 8)
+                | data[offset + 1]
+            )
+
+            if not jumped:
+                original_offset = offset + 2
+
+            offset = pointer
+            jumped = True
+            continue
+
+        # End
         if length == 0:
-            offset += 1
+
+            if not jumped:
+                offset += 1
+
             break
 
         offset += 1
 
-        label = data[offset:offset + length].decode('utf-8')
+        label = data[
+            offset:offset + length
+        ].decode(
+            'utf-8',
+            errors='ignore'
+        )
 
         labels.append(label)
 
         offset += length
 
+    if jumped:
+        return ".".join(labels), original_offset
+
     return ".".join(labels), offset
 
+# =========================================================
+# CACHE CLEANUP
+# =========================================================
+
+def cleanup_expired_cache():
+
+    while True:
+
+        try:
+
+            current_time = time.time()
+
+            with CACHE_LOCK:
+
+                expired = []
+
+                for key, (_, expiration) in DYNAMIC_CACHE.items():
+
+                    if current_time > expiration:
+                        expired.append(key)
+
+                for key in expired:
+
+                    domain, _ = key
+
+                    del DYNAMIC_CACHE[key]
+
+                    print(f"[CACHE EXPIRED] {domain}")
+
+                    log_event(
+                        event_type="CACHE_EXPIRED",
+                        severity="INFO",
+                        domain=domain,
+                        action="CACHE_CLEANUP",
+                        outcome="REMOVED",
+                        details="TTL expired"
+                    )
+
+            time.sleep(30)
+
+        except Exception as e:
+            print(f"[CACHE CLEANUP ERROR] {e}")
 
 # =========================================================
-# EXTRACT IP + TTL
+# RESPONSE PARSER
 # =========================================================
 
 def extract_ip_from_response(response_data):
 
     try:
 
-        _, offset = decode_domain_name(response_data, 12)
+        _, offset = decode_domain_name(
+            response_data,
+            12
+        )
 
         offset += 4
 
-        ancount = struct.unpack('!H', response_data[6:8])[0]
+        ancount = struct.unpack(
+            '!H',
+            response_data[6:8]
+        )[0]
 
         for _ in range(ancount):
 
-            if (response_data[offset] & 0xc0) == 0xc0:
-                offset += 2
-            else:
-                _, offset = decode_domain_name(response_data, offset)
+            _, offset = decode_domain_name(
+                response_data,
+                offset
+            )
 
-            ans_type, ans_class, ans_ttl, ans_rdlength = struct.unpack(
-                '!HHIH',
-                response_data[offset:offset + 10]
+            ans_type, ans_class, ans_ttl, ans_rdlength = (
+                struct.unpack(
+                    '!HHIH',
+                    response_data[offset:offset + 10]
+                )
             )
 
             offset += 10
 
             if ans_type == 1 and ans_rdlength == 4:
 
-                raw_ip_bytes = response_data[offset:offset + 4]
+                raw_ip = response_data[
+                    offset:offset + 4
+                ]
 
-                return socket.inet_ntoa(raw_ip_bytes), ans_ttl
+                return (
+                    socket.inet_ntoa(raw_ip),
+                    ans_ttl
+                )
 
             offset += ans_rdlength
 
     except Exception as e:
+
+        print(f"[PARSER ERROR] {e}")
 
         log_event(
             event_type="DNS_PARSE_ERROR",
@@ -227,13 +352,11 @@ def extract_ip_from_response(response_data):
 
     return None
 
-
 # =========================================================
-# BUILD DNS RESPONSE
+# LOCAL RESPONSE
 # =========================================================
 
 def build_local_response(query_data,
-                         domain,
                          ip_address,
                          qtype,
                          qclass,
@@ -243,13 +366,24 @@ def build_local_response(query_data,
 
     flags = struct.pack('!H', 0x8580)
 
-    counts = struct.pack('!4H', 1, 1, 0, 0)
+    counts = struct.pack(
+        '!4H',
+        1,
+        1,
+        0,
+        0
+    )
 
     header = tx_id + flags + counts
 
-    _, question_end = decode_domain_name(query_data, 12)
+    _, question_end = decode_domain_name(
+        query_data,
+        12
+    )
 
-    question_section = query_data[12:question_end + 4]
+    question_section = query_data[
+        12:question_end + 4
+    ]
 
     pointer = struct.pack('!H', 0xc00c)
 
@@ -272,11 +406,14 @@ def build_local_response(query_data,
         ans_rdata
     )
 
-    return header + question_section + answer_section
-
+    return (
+        header +
+        question_section +
+        answer_section
+    )
 
 # =========================================================
-# BUILD NXDOMAIN
+# NXDOMAIN
 # =========================================================
 
 def build_nxdomain_response(query_data):
@@ -285,63 +422,97 @@ def build_nxdomain_response(query_data):
 
     flags = struct.pack('!H', 0x8183)
 
-    counts = struct.pack('!4H', 1, 0, 0, 0)
+    counts = struct.pack(
+        '!4H',
+        1,
+        0,
+        0,
+        0
+    )
 
     header = tx_id + flags + counts
 
-    _, question_end = decode_domain_name(query_data, 12)
+    _, question_end = decode_domain_name(
+        query_data,
+        12
+    )
 
-    question_section = query_data[12:question_end + 4]
+    question_section = query_data[
+        12:question_end + 4
+    ]
 
     return header + question_section
 
-
 # =========================================================
-# BASIC THREAT DETECTION
+# THREAT HEURISTICS
 # =========================================================
 
 def suspicious_domain_heuristics(domain):
 
-    domain_lower = domain.lower()
+    domain = domain.lower()
 
-    if len(domain_lower) > 80:
-        return "Excessively long domain"
+    if len(domain) > 80:
+        return "Suspiciously long domain"
 
-    if domain_lower.count("-") > 10:
-        return "Potential DGA domain"
+    if domain.count("-") > 10:
+        return "Possible DGA domain"
 
-    if domain_lower.endswith(".ru"):
+    if domain.endswith(".ru"):
         return "High-risk TLD"
 
     return None
 
+# =========================================================
+# BLOCK CHECK
+# =========================================================
+
+def is_blocked(domain):
+
+    domain = domain.lower()
+
+    return any(
+        domain == blocked or
+        domain.endswith("." + blocked)
+        for blocked in BLOCKLIST_DOMAINS
+    )
 
 # =========================================================
-# MAIN ROUTING ENGINE
+# QUERY HANDLER
 # =========================================================
 
-def handle_client_query(data, client_address, server_socket):
+def handle_client_query(data,
+                        client_address,
+                        server_socket):
 
     client_ip = client_address[0]
 
     try:
 
-        domain, offset = decode_domain_name(data, 12)
+        domain, offset = decode_domain_name(
+            data,
+            12
+        )
 
         qtype, qclass = struct.unpack(
             '!2H',
             data[offset:offset + 4]
         )
 
-        print(f"[Query] {domain} from {client_ip}")
+        cache_key = (domain, qtype)
+
+        print(
+            f"[QUERY] "
+            f"{domain} "
+            f"from {client_ip}"
+        )
 
         # =================================================
-        # THREAT HEURISTICS
+        # HEURISTICS
         # =================================================
 
-        heuristic_result = suspicious_domain_heuristics(domain)
+        heuristic = suspicious_domain_heuristics(domain)
 
-        if heuristic_result:
+        if heuristic:
 
             log_event(
                 event_type="SUSPICIOUS_DOMAIN",
@@ -350,18 +521,25 @@ def handle_client_query(data, client_address, server_socket):
                 client_ip=client_ip,
                 action="INSPECT",
                 outcome="FLAGGED",
-                details=heuristic_result
+                details=heuristic
             )
 
         # =================================================
-        # BLOCKLIST CHECK
+        # BLOCKLIST
         # =================================================
 
-        if domain.lower() in BLOCKLIST_DOMAINS:
+        if is_blocked(domain):
 
             SECURITY_METRICS["blocked_domains"] += 1
 
             print(f"[BLOCKED] {domain}")
+
+            response = build_nxdomain_response(data)
+
+            server_socket.sendto(
+                response,
+                client_address
+            )
 
             log_event(
                 event_type="DNS_BLOCK",
@@ -370,140 +548,111 @@ def handle_client_query(data, client_address, server_socket):
                 client_ip=client_ip,
                 action="BLOCK",
                 outcome="NXDOMAIN",
-                details="Matched threat intelligence blocklist"
+                details="Threat intelligence match"
             )
-
-            response = build_nxdomain_response(data)
-
-            server_socket.sendto(response, client_address)
 
             return
 
         # =================================================
-        # STATIC LOCAL RECORDS
+        # LOCAL RECORDS
         # =================================================
 
-        elif domain in LOCAL_RECORDS and qtype == 1:
+        if (
+            domain in LOCAL_RECORDS
+            and qtype == 1
+        ):
 
             SECURITY_METRICS["local_resolutions"] += 1
 
             local_ip = LOCAL_RECORDS[domain]
 
-            print(f"[LOCAL] {domain} -> {local_ip}")
-
-            log_event(
-                event_type="LOCAL_RESOLUTION",
-                severity="INFO",
-                domain=domain,
-                client_ip=client_ip,
-                action="LOCAL_LOOKUP",
-                outcome="SUCCESS",
-                details=f"Resolved locally to {local_ip}"
+            print(
+                f"[LOCAL] "
+                f"{domain} -> {local_ip}"
             )
 
             response = build_local_response(
                 data,
-                domain,
                 local_ip,
                 qtype,
                 qclass
             )
 
-            server_socket.sendto(response, client_address)
+            server_socket.sendto(
+                response,
+                client_address
+            )
 
             return
 
         # =================================================
-        # DYNAMIC CACHE
+        # CACHE
         # =================================================
 
-        elif domain in DYNAMIC_CACHE and qtype == 1:
+        with CACHE_LOCK:
 
-            cached_ip, expiration_time = DYNAMIC_CACHE[domain]
+            if cache_key in DYNAMIC_CACHE:
 
-            current_time = time.time()
-
-            if current_time > expiration_time:
-
-                print(f"[CACHE EXPIRED] {domain}")
-
-                del DYNAMIC_CACHE[domain]
-
-                log_event(
-                    event_type="CACHE_EXPIRED",
-                    severity="INFO",
-                    domain=domain,
-                    client_ip=client_ip,
-                    action="CACHE_PURGE",
-                    outcome="EXPIRED",
-                    details="TTL expired"
+                cached_ip, expiration = (
+                    DYNAMIC_CACHE[cache_key]
                 )
 
-            else:
+                if time.time() < expiration:
 
-                SECURITY_METRICS["cache_hits"] += 1
+                    SECURITY_METRICS["cache_hits"] += 1
 
-                ttl_remaining = int(
-                    expiration_time - current_time
-                )
+                    ttl_remaining = int(
+                        expiration - time.time()
+                    )
 
-                print(
-                    f"[CACHE HIT] {domain} -> {cached_ip}"
-                )
+                    print(
+                        f"[CACHE HIT] {domain}"
+                    )
 
-                log_event(
-                    event_type="CACHE_HIT",
-                    severity="INFO",
-                    domain=domain,
-                    client_ip=client_ip,
-                    action="CACHE_LOOKUP",
-                    outcome="SUCCESS",
-                    details=f"IP={cached_ip}, TTL={ttl_remaining}s"
-                )
+                    response = build_local_response(
+                        data,
+                        cached_ip,
+                        qtype,
+                        qclass,
+                        ttl_remaining
+                    )
 
-                response = build_local_response(
-                    data,
-                    domain,
-                    cached_ip,
-                    qtype,
-                    qclass,
-                    ttl=ttl_remaining
-                )
+                    server_socket.sendto(
+                        response,
+                        client_address
+                    )
 
-                server_socket.sendto(response, client_address)
+                    return
 
-                return
+                else:
+
+                    del DYNAMIC_CACHE[cache_key]
 
         # =================================================
-        # UPSTREAM FORWARDING
+        # FORWARD
         # =================================================
 
         SECURITY_METRICS["cache_misses"] += 1
 
-        print(f"[FORWARD] {domain} -> {UPSTREAM_DNS[0]}")
-
-        log_event(
-            event_type="CACHE_MISS",
-            severity="INFO",
-            domain=domain,
-            client_ip=client_ip,
-            action="FORWARD",
-            outcome="UPSTREAM_QUERY",
-            details=f"Forwarding to {UPSTREAM_DNS[0]}"
-        )
+        print(f"[FORWARD] {domain}")
 
         proxy_socket = socket.socket(
             socket.AF_INET,
             socket.SOCK_DGRAM
         )
 
-        proxy_socket.settimeout(3.0)
+        proxy_socket.settimeout(5)
 
         try:
 
-            proxy_socket.sendto(data, UPSTREAM_DNS)
+            proxy_socket.sendto(
+                data,
+                UPSTREAM_DNS
+            )
 
-            upstream_response, _ = proxy_socket.recvfrom(512)
+            upstream_response, _ = (
+                proxy_socket.recvfrom(512)
+            )
 
             server_socket.sendto(
                 upstream_response,
@@ -512,42 +661,44 @@ def handle_client_query(data, client_address, server_socket):
 
             if qtype == 1:
 
-                parsed_result = extract_ip_from_response(
+                parsed = extract_ip_from_response(
                     upstream_response
                 )
 
-                if parsed_result:
+                if parsed:
 
-                    extracted_ip, upstream_ttl = parsed_result
+                    extracted_ip, upstream_ttl = parsed
 
-                    expire_timestamp = (
-                        time.time() + upstream_ttl
-                    )
+                    with CACHE_LOCK:
 
-                    DYNAMIC_CACHE[domain] = (
-                        extracted_ip,
-                        expire_timestamp
-                    )
+                        DYNAMIC_CACHE[cache_key] = (
+                            extracted_ip,
+                            time.time() + upstream_ttl
+                        )
 
                     print(
-                        f"[CACHE STORE] {domain} -> {extracted_ip}"
+                        f"[CACHE STORE] "
+                        f"{domain} -> {extracted_ip}"
                     )
 
                     log_event(
-                        event_type="CACHE_UPDATE",
+                        event_type="CACHE_STORE",
                         severity="INFO",
                         domain=domain,
                         client_ip=client_ip,
-                        action="CACHE_STORE",
+                        action="CACHE_UPDATE",
                         outcome="SUCCESS",
-                        details=f"Stored {extracted_ip} with TTL={upstream_ttl}"
+                        details=(
+                            f"{extracted_ip} "
+                            f"TTL={upstream_ttl}"
+                        )
                     )
 
         except socket.timeout:
 
             SECURITY_METRICS["upstream_failures"] += 1
 
-            print("[TIMEOUT] Upstream DNS failed")
+            print("[TIMEOUT] Upstream DNS timeout")
 
             log_event(
                 event_type="UPSTREAM_TIMEOUT",
@@ -556,7 +707,7 @@ def handle_client_query(data, client_address, server_socket):
                 client_ip=client_ip,
                 action="FORWARD",
                 outcome="TIMEOUT",
-                details=f"Upstream {UPSTREAM_DNS[0]} did not respond"
+                details=UPSTREAM_DNS[0]
             )
 
         finally:
@@ -565,10 +716,10 @@ def handle_client_query(data, client_address, server_socket):
 
     except Exception as e:
 
-        print(f"[ERROR] {e}")
+        print(f"[HANDLER ERROR] {e}")
 
         log_event(
-            event_type="SERVER_EXCEPTION",
+            event_type="HANDLER_EXCEPTION",
             severity="CRITICAL",
             client_ip=client_ip,
             action="PROCESS_QUERY",
@@ -576,23 +727,41 @@ def handle_client_query(data, client_address, server_socket):
             details=str(e)
         )
 
-
 # =========================================================
-# SERVER MAIN LOOP
+# MAIN SERVER
 # =========================================================
 
 def main():
 
     load_configuration()
 
+    cleanup_thread = threading.Thread(
+        target=cleanup_expired_cache,
+        daemon=True
+    )
+
+    cleanup_thread.start()
+
+    executor = ThreadPoolExecutor(
+        max_workers=100
+    )
+
     server_socket = socket.socket(
         socket.AF_INET,
         socket.SOCK_DGRAM
     )
 
+    server_socket.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
     try:
 
-        server_socket.bind((LISTEN_IP, LISTEN_PORT))
+        server_socket.bind(
+            (LISTEN_IP, LISTEN_PORT)
+        )
 
         print(
             f"[*] DNS Server listening on "
@@ -604,35 +773,39 @@ def main():
             severity="INFO",
             action="START_SERVER",
             outcome="SUCCESS",
-            details=f"Listening on {LISTEN_IP}:{LISTEN_PORT}"
+            details=f"{LISTEN_IP}:{LISTEN_PORT}"
         )
 
         while True:
 
-            data, client_address = server_socket.recvfrom(512)
+            try:
 
-            handle_client_query(
-                data,
-                client_address,
-                server_socket
-            )
+                data, client_address = (
+                    server_socket.recvfrom(512)
+                )
+
+                executor.submit(
+                    handle_client_query,
+                    data,
+                    client_address,
+                    server_socket
+                )
+
+            except Exception as e:
+
+                print(f"[MAIN LOOP ERROR] {e}")
 
     except KeyboardInterrupt:
 
-        print("\n[*] Shutting down DNS Server.")
+        print("\n[*] DNS Server shutting down.")
 
-        log_event(
-            event_type="SERVER_SHUTDOWN",
-            severity="INFO",
-            action="STOP_SERVER",
-            outcome="SUCCESS",
-            details="Manual shutdown"
-        )
+    except Exception as e:
+
+        print(f"[FATAL ERROR] {e}")
 
     finally:
 
         server_socket.close()
-
 
 # =========================================================
 # ENTRYPOINT
