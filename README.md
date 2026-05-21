@@ -6,9 +6,6 @@
 <p align="center">
   <img src="https://readme-typing-svg.herokuapp.com?color=00FF00&size=28&center=true&vCenter=true&width=900&lines=DNS+Security+Server;Python+Networking+Project;Cybersecurity+Internship+Project;System-Wide+DNS+Filtering">
 </p>
-<p align="center">
-  <img src="./banner.png" alt="DNS Security Server Banner" width="100%">
-</p>
 [![Star History Chart](https://api.star-history.com/svg?repos=YOUR_USERNAME/DNS-Security-Server&type=Date)](https://star-history.com/#YOUR_USERNAME/DNS-Security-Server&Date)
 # 🛡️ DNS Security Server 🚀
 
