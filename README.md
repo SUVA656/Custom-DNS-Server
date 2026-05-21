@@ -225,11 +225,11 @@ edge-chat.facebook.com
 ## 🔽 Clone Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/DNS-Security-Server.git
+git clone https://github.com/SUVA656/Custom-DNS-Server.git
 ```
 
 ```bash
-cd DNS-Security-Server
+cd Custom-DNS-Server
 ```
 
 ---
