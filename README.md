@@ -4,8 +4,12 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/License-Educational-yellow)
 <p align="center">
+  <img src="https://readme-typing-svg.herokuapp.com?color=00FF00&size=28&center=true&vCenter=true&width=900&lines=DNS+Security+Server;Python+Networking+Project;Cybersecurity+Internship+Project;System-Wide+DNS+Filtering">
+</p>
+<p align="center">
   <img src="./banner.jpg" alt="DNS Security Server Banner" width="100%">
 </p>
+[![Star History Chart](https://api.star-history.com/svg?repos=YOUR_USERNAME/DNS-Security-Server&type=Date)](https://star-history.com/#YOUR_USERNAME/DNS-Security-Server&Date)
 # 🛡️ DNS Security Server 🚀
 
 A high-performance multi-threaded DNS Security Server built in Python with advanced features like domain blocking, DNS caching, local DNS resolution, upstream forwarding, audit logging, heuristic threat detection, and system-wide DNS integration.
@@ -126,6 +130,39 @@ DNS-Security-Server/
 
 ---
 
+# 📊 Project Statistics
+
+- Multi-threaded architecture
+- Concurrent DNS query handling
+- DNS packet parsing
+- TTL-based caching
+- Real-time audit logging
+- Wildcard domain filtering
+- System-wide DNS integration
+---
+
+
+---
+# 🎯 Why This Project?
+
+Traditional DNS systems are vulnerable to:
+- malicious domains
+- phishing
+- tracking
+- unwanted traffic
+
+This project demonstrates how custom DNS security layers can be built using low-level networking and system programming concepts.
+---
+
+
+---
+# 🤝 Contributions
+
+Contributions, issues, and feature requests are welcome.
+---
+
+
+---
 # ⚙️ Configuration
 
 ## 📄 config.json
