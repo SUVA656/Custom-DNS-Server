@@ -6,9 +6,7 @@
 <p align="center">
   <img src="https://readme-typing-svg.herokuapp.com?color=00FF00&size=28&center=true&vCenter=true&width=900&lines=DNS+Security+Server;Python+Networking+Project;Cybersecurity+Internship+Project;System-Wide+DNS+Filtering">
 </p>
----
 
----
 # 🛡️ DNS Security Server 🚀
 
 A high-performance multi-threaded DNS Security Server built in Python with advanced features like domain blocking, DNS caching, local DNS resolution, upstream forwarding, audit logging, heuristic threat detection, and system-wide DNS integration.
@@ -17,7 +15,6 @@ A high-performance multi-threaded DNS Security Server built in Python with advan
 
 ---
 # ⭐ Star History
----
 <p align="center">
   <img src="https://api.star-history.com/svg?repos=SUVA656/Custom-DNS-Server&type=Date" width="700">
 </p>
