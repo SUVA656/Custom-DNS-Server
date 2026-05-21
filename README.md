@@ -1,3 +1,8 @@
+![Python](https://img.shields.io/badge/Python-3.9+-blue)
+![Status](https://img.shields.io/badge/Status-Active-success)
+![Security](https://img.shields.io/badge/Focus-Cybersecurity-red)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
+![License](https://img.shields.io/badge/License-Educational-yellow)
 <p align="center">
   <img src="banner.jpg" width="100%">
 </p>
