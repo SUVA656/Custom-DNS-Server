@@ -4,7 +4,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/License-Educational-yellow)
 <p align="center">
-  <img src="banner.jpg" width="100%">
+  <img src="./banner.jpg" alt="DNS Security Server Banner" width="100%">
 </p>
 # 🛡️ DNS Security Server 🚀
 
