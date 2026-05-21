@@ -6,9 +6,6 @@
 <p align="center">
   <img src="https://readme-typing-svg.herokuapp.com?color=00FF00&size=28&center=true&vCenter=true&width=900&lines=DNS+Security+Server;Python+Networking+Project;Cybersecurity+Internship+Project;System-Wide+DNS+Filtering">
 </p>
-# ⭐ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=SUVA656/Custom-DNS-Server&type=Date)](https://star-history.com/#SUVA656/Custom-DNS-Server&Date)
 ---
 
 ---
@@ -19,7 +16,15 @@ A high-performance multi-threaded DNS Security Server built in Python with advan
 💼 Developed as part of internship work at **OFDC**.
 
 ---
+# ⭐ Star History
+---
+<p align="center">
+  <img src="https://api.star-history.com/svg?repos=SUVA656/Custom-DNS-Server&type=Date" width="700">
+</p>
+---
 
+
+---
 # ✨ Features
 
 ✅ Multi-threaded DNS server  
