@@ -18,7 +18,6 @@ A high-performance multi-threaded DNS Security Server built in Python with advan
 <p align="center">
   <img src="https://api.star-history.com/svg?repos=SUVA656/Custom-DNS-Server&type=Date" width="700">
 </p>
----
 
 
 ---
