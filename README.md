@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="banner.png" width="100%">
+</p>
 # 🛡️ DNS Security Server 🚀
 
 A high-performance multi-threaded DNS Security Server built in Python with advanced features like domain blocking, DNS caching, local DNS resolution, upstream forwarding, audit logging, heuristic threat detection, and system-wide DNS integration.
