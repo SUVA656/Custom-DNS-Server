@@ -1,16 +1,52 @@
+import json
+import time
 import socket
 import struct
 
 # --- Configuration ---
 LISTEN_IP = "127.0.0.1"
-LISTEN_PORT = 5353
+LISTEN_PORT = 5354
 UPSTREAM_DNS = ("8.8.8.8", 53)
 
-# Local DNS Records mapping domain strings to desired IPv4 responses
-LOCAL_RECORDS = {
-    "example.local": "192.168.1.100",
-    "dev.local": "127.0.0.1",
-}
+# Local DNS Records (Permanent)
+LOCAL_RECORDS = {}
+
+# NEW: Security threat intelligence storage
+BLOCKLIST_FILE = "blocklist.txt"
+BLOCKLIST_DOMAINS = set()
+
+# NEW: In-memory dynamic cache for upstream answers
+# Structure: {"domain": "ip_address"}
+DYNAMIC_CACHE = {}
+
+def load_configuration():
+    global LISTEN_PORT, UPSTREAM_DNS, LOCAL_RECORDS, BLOCKLIST_FILE, BLOCKLIST_DOMAINS
+    try:
+        with open("config.json", "r") as f:
+            config_data = json.load(f)
+            
+        LISTEN_PORT = config_data.get("listen_port", 5354)
+        UPSTREAM_DNS = (
+            config_data.get("upstream_dns_ip", "8.8.8.8"),
+            config_data.get("upstream_dns_port", 53)
+        )
+        LOCAL_RECORDS = config_data.get("local_records", {})
+        BLOCKLIST_FILE = config_data.get("blocklist_file", "blocklist.txt")
+        
+        # Load the blocklist domains from the specified text file
+        BLOCKLIST_DOMAINS.clear()
+        try:
+            with open(BLOCKLIST_FILE, "r") as bf:
+                for line in bf:
+                    stripped = line.strip().lower()
+                    if stripped and not stripped.startswith("#"):
+                        BLOCKLIST_DOMAINS.add(stripped)
+            print(f"[*] Configuration loaded. Loaded {len(BLOCKLIST_DOMAINS)} malicious domains into firewall memory.")
+        except FileNotFoundError:
+            print(f"[!] Warning: Blocklist file '{BLOCKLIST_FILE}' not found. No domains blocked.")
+            
+    except Exception as e:
+        print(f"[!] Warning: Failed to load config.json ({e}). Using defaults.")
 
 def decode_domain_name(data, offset):
     """
@@ -97,6 +133,29 @@ def build_local_response(query_data, domain, ip_address, qtype, qclass):
     
     return header + question_section + answer_section
 
+def build_nxdomain_response(query_data):
+    """
+    Constructs a valid DNS reply packet with an NXDOMAIN (RCODE 3) error code,
+    telling the client that the requested malicious domain does not exist.
+    """
+    tx_id = query_data[:2]
+    
+    # Flags: Response, Opcode 0, Authoritative=0, Recursion Desired=1, Recursion Available=1, RCODE=3 (NXDOMAIN)
+    # Hex value: 0x8183
+    flags = struct.pack('!H', 0x8183)
+    
+    # Counts: 1 Question, 0 Answers, 0 Authority, 0 Additional
+    counts = struct.pack('!4H', 1, 0, 0, 0)
+    
+    header = tx_id + flags + counts
+    
+    # Replicate the original Question Section
+    _, question_end = decode_domain_name(query_data, 12)
+    question_section = query_data[12:question_end + 4]
+    
+    # NXDOMAIN responses carry no answer section, just the error flag!
+    return header + question_section
+
 def handle_client_query(data, client_address, server_socket):
     try:
         domain, offset = decode_domain_name(data, 12)
@@ -104,20 +163,27 @@ def handle_client_query(data, client_address, server_socket):
         
         print(f"[Query] Request for '{domain}' (Type: {qtype}) from {client_address}")
         
-        # ROUTING LOGIC 1: Permanent Local Records Match
-        if domain in LOCAL_RECORDS and qtype == 1:
+        # ROUTING CRITERIA 1: NEW! Threat Intelligence Firewall (Blocklist Interception)
+        if domain.lower() in BLOCKLIST_DOMAINS:
+            print(f"  [SECURITY ALERT] Blocked request for malicious domain: '{domain}' from {client_address}")
+            response = build_nxdomain_response(data)
+            server_socket.sendto(response, client_address)
+            return  # Stop processing immediately!
+            
+        # ROUTING CRITERIA 2: Permanent Local Records Match
+        elif domain in LOCAL_RECORDS and qtype == 1:
             print(f"  -> [Cache Hit] Resolving '{domain}' via LOCAL_RECORDS to {LOCAL_RECORDS[domain]}")
             response = build_local_response(data, domain, LOCAL_RECORDS[domain], qtype, qclass)
             server_socket.sendto(response, client_address)
         
-        # ROUTING LOGIC 2: NEW! Dynamic In-Memory Cache Match
+        # ROUTING CRITERIA 3: Dynamic In-Memory Cache Match
         elif domain in DYNAMIC_CACHE and qtype == 1:
             cached_ip = DYNAMIC_CACHE[domain]
             print(f"  -> [Dynamic Cache Hit] Resolving '{domain}' via MEMORY CACHE to {cached_ip}")
             response = build_local_response(data, domain, cached_ip, qtype, qclass)
             server_socket.sendto(response, client_address)
             
-        # ROUTING LOGIC 3: Cache Miss (Forward & Learn)
+        # ROUTING CRITERIA 4: Cache Miss (Forward & Learn)
         else:
             print(f"  -> [Cache Miss] Forwarding '{domain}' to upstream {UPSTREAM_DNS[0]}")
             proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -126,11 +192,8 @@ def handle_client_query(data, client_address, server_socket):
             try:
                 proxy_socket.sendto(data, UPSTREAM_DNS)
                 upstream_response, _ = proxy_socket.recvfrom(512)
-                
-                # Send the answer back to the client immediately
                 server_socket.sendto(upstream_response, client_address)
                 
-                # NEW: Try to extract the IP and save it to the cache for next time!
                 if qtype == 1:
                     extracted_ip = extract_ip_from_response(upstream_response)
                     if extracted_ip:
@@ -144,8 +207,12 @@ def handle_client_query(data, client_address, server_socket):
                 
     except Exception as e:
         print(f"  !! [Error] Failed to process packet: {e}")
+
 def main():
     # Setup UDP Listener socket
+    load_configuration()
+    
+    # 2. Setup UDP Listener socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
     try:
@@ -153,7 +220,6 @@ def main():
         print(f"[*] Custom DNS Server listening on {LISTEN_IP}:{LISTEN_PORT}...")
         
         while True:
-            # DNS over UDP messages are traditionally restricted to a 512-byte payload maximum
             data, client_address = server_socket.recvfrom(512)
             handle_client_query(data, client_address, server_socket)
             
