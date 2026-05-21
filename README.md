@@ -508,7 +508,7 @@ This project demonstrates practical understanding of:
 
 # 👨‍💻 Author
 
-### YOUR_NAME
+### Suvankar Ghosh Dastidar
 
 🎓 AI & Robotics Engineering Student  
 💻 Python Developer  
